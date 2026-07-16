@@ -898,6 +898,73 @@ func TestCompactZeroLineFailuresReachAttemptCap(t *testing.T) {
 	}
 }
 
+func TestCompactZeroEditEscalationRejectsUnsafeInputsWithoutMutation(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "base\none\ntwo\nthree\nwrong\n")
+	state := newCompactTestState(t, repo, "compact-zero-edit-rejections")
+	finding := Finding{ID: "R3-001", Location: "tracked.txt:5", Severity: "CRITICAL", Claim: "wrong value", ProofRefs: []string{"candidate-only failure"}}
+	if err := state.CompleteReview(CompactReviewInput{
+		LensResults:     []LensResult{{Lens: state.SelectedLenses[0], Findings: []Finding{finding}, Evidence: []string{"reviewed"}}},
+		Classifications: []FindingEvidence{{FindingID: finding.ID, Class: EvidenceDeterministic, Causality: CausalIntroduced, Proof: "changed hunk"}},
+		RefuterOutcomes: []EvidenceResult{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.BeginCorrection(1); err != nil {
+		t.Fatal(err)
+	}
+	unchanged, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{
+		Kind: TargetFixDiff, BaseRef: state.CurrentSnapshot.CandidateTree,
+		IntendedUntracked: state.InitialSnapshot.IntendedUntracked, LedgerIDs: state.FixFindingIDs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixHash := FixDeltaHashForSnapshot(unchanged)
+	valid := ScopedValidationResult{
+		LedgerIDs: state.FixFindingIDs, FixCausedFindings: []Finding{}, FollowUps: []FollowUp{},
+		OriginalCriteria:     ValidationCheck{EvidenceHash: hash("2"), FixDeltaHash: fixHash, Passed: false},
+		CorrectionRegression: ValidationCheck{EvidenceHash: hash("3"), FixDeltaHash: fixHash, Passed: true},
+	}
+	tests := []struct {
+		name       string
+		snapshot   func(Snapshot) Snapshot
+		actual     int
+		validation func(ScopedValidationResult) ScopedValidationResult
+		evidence   []byte
+	}{
+		{name: "original criteria passed", validation: func(value ScopedValidationResult) ScopedValidationResult {
+			value.OriginalCriteria.Passed = true
+			return value
+		}, evidence: []byte("failed verification")},
+		{name: "correction regression failed", validation: func(value ScopedValidationResult) ScopedValidationResult {
+			value.CorrectionRegression.Passed = false
+			return value
+		}, evidence: []byte("failed verification")},
+		{name: "missing final evidence", evidence: nil},
+		{name: "nonzero actual lines", actual: 1, evidence: []byte("failed verification")},
+		{name: "path drift", snapshot: func(value Snapshot) Snapshot { value.Paths = append(value.Paths, "outside.go"); return value }, evidence: []byte("failed verification")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate, validation := unchanged, valid
+			if tt.snapshot != nil {
+				candidate = tt.snapshot(candidate)
+			}
+			if tt.validation != nil {
+				validation = tt.validation(validation)
+			}
+			before := state
+			if err := state.EscalateZeroEditCorrection(candidate, tt.actual, validation, tt.evidence); err == nil {
+				t.Fatal("unsafe zero-edit escalation was accepted")
+			}
+			if !reflect.DeepEqual(state, before) {
+				t.Fatalf("rejected zero-edit escalation mutated state:\nbefore=%#v\nafter=%#v", before, state)
+			}
+		})
+	}
+}
+
 func TestCompactStoreFailsClosedForCorruptionAndIgnoresInvalidTempState(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	writeSnapshotFile(t, repo, "tracked.txt", "candidate\n")

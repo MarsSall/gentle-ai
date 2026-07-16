@@ -645,6 +645,16 @@ func validateCompactRepositoryEvidence(ctx context.Context, repo string, current
 			return errors.New("compact correction size does not match repository evidence")
 		}
 	}
+	if operation == "review/escalate-zero-edit" {
+		escalation := next.ZeroEditEscalation
+		if escalation == nil || builder.ValidateEvidence(ctx, escalation.Snapshot) != nil {
+			return errors.New("compact zero-edit snapshot is not repository-derived")
+		}
+		lines, err := builder.ChangedLines(ctx, escalation.Snapshot)
+		if err != nil || lines != 0 || escalation.ActualLines != 0 {
+			return errors.New("compact zero-edit escalation does not have zero repository-derived changed lines")
+		}
+	}
 	if operation == "review/invalidate" {
 		if err := rebuildCurrentSnapshotEvidence(ctx, repo, next.InitialSnapshot); err != nil {
 			return err
@@ -693,6 +703,18 @@ func validateCompactSuccessor(previous, next CompactState, operation string) err
 		}
 		if !reflectCompactReviewData(previous, next) || previous.EvidenceHash != next.EvidenceHash {
 			return fmt.Errorf("%w: compact correction changed frozen review evidence", ErrInvalidSuccessor)
+		}
+	case "review/escalate-zero-edit":
+		if previous.State != StateCorrectionRequired || previous.ProposedCorrectionLines == nil || next.State != StateEscalated || next.ZeroEditEscalation == nil {
+			return fmt.Errorf("%w: invalid compact zero-edit escalation", ErrInvalidSuccessor)
+		}
+		expected := previous
+		expected.State = StateEscalated
+		expected.FollowUps = append(append([]FollowUp{}, previous.FollowUps...), next.ZeroEditEscalation.FollowUps...)
+		expected.EvidenceHash = next.EvidenceHash
+		expected.ZeroEditEscalation = next.ZeroEditEscalation
+		if !compactStateEqual(expected, next) {
+			return fmt.Errorf("%w: compact zero-edit escalation changed unrelated state", ErrInvalidSuccessor)
 		}
 	case "review/complete-verification":
 		if previous.State != StateValidating || next.State != StateApproved && next.State != StateEscalated || !validSHA256(next.EvidenceHash) {

@@ -679,10 +679,22 @@ func RunReviewFacadeFinalize(args []string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if err := state.CompleteCorrection(fixSnapshot, actual, nativeValidation); err != nil {
+		operation := "review/complete-fix"
+		if fixSnapshot.CandidateTree == fixSnapshot.BaseTree {
+			if !*failed {
+				return errors.New("unchanged compact correction requires --failed")
+			}
+			if len(evidence) == 0 {
+				return errors.New("unchanged compact correction requires final evidence")
+			}
+			if err := state.EscalateZeroEditCorrection(fixSnapshot, actual, nativeValidation, evidence); err != nil {
+				return fmt.Errorf("escalate compact zero-edit correction: %w", err)
+			}
+			operation = "review/escalate-zero-edit"
+		} else if err := state.CompleteCorrection(fixSnapshot, actual, nativeValidation); err != nil {
 			return fmt.Errorf("complete compact correction: %w", err)
 		}
-		revision, err := store.Replace(record.Revision, "review/complete-fix", state)
+		revision, err := store.Replace(record.Revision, operation, state)
 		if err != nil {
 			return err
 		}

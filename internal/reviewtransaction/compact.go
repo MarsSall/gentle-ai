@@ -16,6 +16,7 @@ import (
 
 const CompactStateSchema = "gentle-ai.review-state/v2"
 const CompactReceiptSchema = "gentle-ai.review-receipt/v2"
+const CompactZeroEditEscalationReason = "bounded correction made no candidate changes while original criteria remained unsatisfied"
 
 const (
 	StateCorrectionRequired      State = "correction_required"
@@ -52,6 +53,7 @@ type CompactState struct {
 	Recovery                  *CompactRecoveryProvenance `json:"recovery,omitempty"`
 	CorrectionAttempts        []CompactCorrectionAttempt `json:"correction_attempts,omitempty"`
 	CumulativeCorrectionLines int                        `json:"cumulative_correction_lines,omitempty"`
+	ZeroEditEscalation        *CompactZeroEditEscalation `json:"zero_edit_escalation,omitempty"`
 }
 
 type CompactCorrectionAttempt struct {
@@ -61,6 +63,16 @@ type CompactCorrectionAttempt struct {
 	FixDeltaHash         string          `json:"fix_delta_hash"`
 	OriginalCriteria     ValidationCheck `json:"original_criteria"`
 	CorrectionRegression ValidationCheck `json:"correction_regression"`
+}
+
+type CompactZeroEditEscalation struct {
+	Snapshot             Snapshot        `json:"snapshot"`
+	ActualLines          int             `json:"actual_lines"`
+	FixDeltaHash         string          `json:"fix_delta_hash"`
+	OriginalCriteria     ValidationCheck `json:"original_criteria"`
+	CorrectionRegression ValidationCheck `json:"correction_regression"`
+	FollowUps            []FollowUp      `json:"follow_ups"`
+	Reason               string          `json:"reason"`
 }
 
 type RecoveryDisposition string
@@ -235,7 +247,7 @@ func (state CompactState) Validate() error {
 	}
 	switch state.State {
 	case StateReviewing:
-		if len(state.Findings) != 0 || len(state.Classifications) != 0 || len(state.Outcomes) != 0 || len(state.FixFindingIDs) != 0 || state.ProposedCorrectionLines != nil || state.ActualCorrectionLines != nil || state.EvidenceHash != "" {
+		if len(state.Findings) != 0 || len(state.Classifications) != 0 || len(state.Outcomes) != 0 || len(state.FixFindingIDs) != 0 || state.ProposedCorrectionLines != nil || state.ActualCorrectionLines != nil || state.EvidenceHash != "" || state.ZeroEditEscalation != nil {
 			return errors.New("reviewing compact state contains post-review data")
 		}
 		if state.InvalidationReason != "" {
@@ -248,15 +260,15 @@ func (state CompactState) Validate() error {
 			return errors.New("invalidated compact state must retain only a pristine reviewing authority and reason")
 		}
 	case StateCorrectionRequired:
-		if len(state.LensResults) != len(state.SelectedLenses) || len(state.FixFindingIDs) == 0 || state.EvidenceHash != "" {
+		if len(state.LensResults) != len(state.SelectedLenses) || len(state.FixFindingIDs) == 0 || state.EvidenceHash != "" || state.ZeroEditEscalation != nil {
 			return errors.New("correction-required compact state is incomplete")
 		}
 	case StateValidating:
-		if len(state.LensResults) != len(state.SelectedLenses) || state.EvidenceHash != "" {
+		if len(state.LensResults) != len(state.SelectedLenses) || state.EvidenceHash != "" || state.ZeroEditEscalation != nil {
 			return errors.New("validating compact state is incomplete")
 		}
 	case StateApproved:
-		if !validSHA256(state.EvidenceHash) {
+		if !validSHA256(state.EvidenceHash) || state.ZeroEditEscalation != nil {
 			return errors.New("approved compact state requires verification evidence")
 		}
 	case StateEscalated:
@@ -427,6 +439,9 @@ func validateCompactCorrection(state CompactState) error {
 		if cumulative != state.CumulativeCorrectionLines || cumulative > state.CorrectionBudget && state.State != StateEscalated || !snapshotsEqual(state.CurrentSnapshot, state.CorrectionAttempts[len(state.CorrectionAttempts)-1].Snapshot) {
 			return errors.New("compact cumulative correction accounting is invalid")
 		}
+		if state.ZeroEditEscalation != nil {
+			return validateCompactZeroEditEscalation(state)
+		}
 		if state.State == StateCorrectionRequired {
 			if state.ProposedCorrectionLines != nil && state.CumulativeCorrectionLines+*state.ProposedCorrectionLines > state.CorrectionBudget {
 				return errors.New("compact correction forecast exceeds the remaining budget")
@@ -442,6 +457,9 @@ func validateCompactCorrection(state CompactState) error {
 		if state.State == StateEscalated && len(state.CorrectionAttempts) >= MaxCompactCorrectionAttempts && state.ActualCorrectionLines == nil {
 			return nil
 		}
+	}
+	if state.ZeroEditEscalation != nil {
+		return validateCompactZeroEditEscalation(state)
 	}
 	corrected := !snapshotsEqual(state.CurrentSnapshot, state.InitialSnapshot) || state.FixDeltaHash != EmptyFixDeltaHash || state.ActualCorrectionLines != nil || state.OriginalCriteria != nil || state.CorrectionRegression != nil
 	if !corrected {
@@ -484,6 +502,46 @@ func validateCompactCorrection(state CompactState) error {
 	}
 	if (state.State == StateValidating || state.State == StateApproved) && (!state.OriginalCriteria.Passed || !state.CorrectionRegression.Passed) {
 		return errors.New("compact correction checks must both pass before validation or approval")
+	}
+	return nil
+}
+
+func validateCompactZeroEditEscalation(state CompactState) error {
+	escalation := state.ZeroEditEscalation
+	if state.State != StateEscalated || state.ProposedCorrectionLines == nil || state.CumulativeCorrectionLines+*state.ProposedCorrectionLines > state.CorrectionBudget ||
+		state.ActualCorrectionLines != nil || state.FixDeltaHash != EmptyFixDeltaHash || state.OriginalCriteria != nil || state.CorrectionRegression != nil || !validSHA256(state.EvidenceHash) {
+		return errors.New("compact zero-edit escalation requires an authorized forecast, failed final evidence, and no completed correction")
+	}
+	if escalation.ActualLines != 0 || escalation.Reason != CompactZeroEditEscalationReason || escalation.Snapshot.Kind != TargetFixDiff ||
+		escalation.Snapshot.Projection != state.InitialSnapshot.Projection || escalation.Snapshot.BaseTree != state.CurrentSnapshot.CandidateTree ||
+		escalation.Snapshot.CandidateTree != escalation.Snapshot.BaseTree || !equalStrings(escalation.Snapshot.LedgerIDs, state.FixFindingIDs) ||
+		!equalStrings(escalation.Snapshot.IntendedUntracked, state.InitialSnapshot.IntendedUntracked) {
+		return errors.New("compact zero-edit escalation is not bound to the unchanged reviewed candidate and causal findings")
+	}
+	if err := validateSnapshot(escalation.Snapshot); err != nil {
+		return err
+	}
+	if err := pathsAreSubset(escalation.Snapshot.Paths, state.GenesisPaths); err != nil {
+		return err
+	}
+	if escalation.FixDeltaHash != FixDeltaHashForSnapshot(escalation.Snapshot) {
+		return errors.New("compact zero-edit escalation fix delta does not match its snapshot")
+	}
+	validation := ScopedValidationResult{OriginalCriteria: escalation.OriginalCriteria, CorrectionRegression: escalation.CorrectionRegression}
+	if err := validateTargetedValidation(validation, escalation.FixDeltaHash); err != nil {
+		return err
+	}
+	if escalation.OriginalCriteria.Passed || !escalation.CorrectionRegression.Passed {
+		return errors.New("compact zero-edit escalation requires failed original criteria and passing correction regression")
+	}
+	if escalation.FollowUps == nil {
+		return errors.New("compact zero-edit escalation follow-ups must be explicit")
+	}
+	if err := validateFollowUps(escalation.FollowUps); err != nil {
+		return err
+	}
+	if len(escalation.FollowUps) > len(state.FollowUps) || !reflect.DeepEqual(escalation.FollowUps, state.FollowUps[len(state.FollowUps)-len(escalation.FollowUps):]) {
+		return errors.New("compact zero-edit escalation follow-ups are not bound to review state")
 	}
 	return nil
 }
@@ -675,6 +733,52 @@ func (state *CompactState) CompleteCorrection(snapshot Snapshot, actual int, val
 		state.OriginalCriteria, state.CorrectionRegression = nil, nil
 	}
 	return state.Validate()
+}
+
+func (state *CompactState) EscalateZeroEditCorrection(snapshot Snapshot, actual int, validation ScopedValidationResult, evidence []byte) error {
+	if state.State != StateCorrectionRequired || state.ProposedCorrectionLines == nil {
+		return fmt.Errorf("cannot escalate zero-edit correction from compact state %q", state.State)
+	}
+	if snapshot.Kind != TargetFixDiff || snapshot.Projection != state.InitialSnapshot.Projection || snapshot.BaseTree != state.CurrentSnapshot.CandidateTree || !equalStrings(snapshot.LedgerIDs, state.FixFindingIDs) {
+		return errors.New("compact zero-edit snapshot is not bound to the reviewed candidate, projection, and causal findings")
+	}
+	if snapshot.CandidateTree != snapshot.BaseTree || actual != 0 {
+		return errors.New("compact zero-edit escalation requires an unchanged candidate tree and zero actual lines")
+	}
+	if err := pathsAreSubset(snapshot.Paths, state.GenesisPaths); err != nil {
+		return err
+	}
+	fixHash := FixDeltaHashForSnapshot(snapshot)
+	if !equalStrings(validation.LedgerIDs, state.FixFindingIDs) || len(validation.FixCausedFindings) != 0 || validation.FollowUps == nil {
+		return errors.New("compact zero-edit validation must cover the causal finding set without expanding correction scope")
+	}
+	if err := validateTargetedValidation(validation, fixHash); err != nil {
+		return err
+	}
+	if validation.OriginalCriteria.Passed || !validation.CorrectionRegression.Passed {
+		return errors.New("compact zero-edit escalation requires failed original criteria and passing correction regression")
+	}
+	if err := validateFollowUps(validation.FollowUps); err != nil {
+		return err
+	}
+	if len(evidence) == 0 {
+		return errors.New("compact zero-edit escalation requires failed final verification evidence")
+	}
+	sum := sha256.Sum256(evidence)
+	next := *state
+	next.State = StateEscalated
+	next.FollowUps = append(append([]FollowUp{}, state.FollowUps...), validation.FollowUps...)
+	next.EvidenceHash = "sha256:" + hex.EncodeToString(sum[:])
+	next.ZeroEditEscalation = &CompactZeroEditEscalation{
+		Snapshot: snapshot, ActualLines: actual, FixDeltaHash: fixHash,
+		OriginalCriteria: validation.OriginalCriteria, CorrectionRegression: validation.CorrectionRegression,
+		FollowUps: append([]FollowUp{}, validation.FollowUps...), Reason: CompactZeroEditEscalationReason,
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	*state = next
+	return nil
 }
 
 func (state *CompactState) CompleteVerification(evidence []byte, approved bool) error {

@@ -799,6 +799,106 @@ func TestReviewFacadeCorrectionFlowResumesFromEachCompactIntermediateState(t *te
 	}
 }
 
+func TestReviewFacadeZeroEditFailedValidationEscalatesAndRecovers(t *testing.T) {
+	repo := initReviewCLIRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "candidate.go"), []byte(strings.Repeat("package candidate\n", 130)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	started := startFacadeReview(t, repo)
+	resultPath := filepath.Join(t.TempDir(), "review.json")
+	writeReviewCLIJSON(t, resultPath, facadeReviewerResult{
+		Findings: []facadeFinding{{
+			Location: "candidate.go:130", Severity: "CRITICAL", Claim: "candidate returns the wrong terminal value",
+			ProofRefs:     []string{"differential test passes on base and fails on candidate"},
+			EvidenceClass: reviewtransaction.EvidenceDeterministic, CausalDisposition: reviewtransaction.CausalIntroduced,
+		}},
+		Evidence: []string{"focused differential test failed on candidate"},
+	})
+	if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--result", resultPath, "--correction-lines", "65"}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	store, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), repo, started.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forecasted, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	validationPath := filepath.Join(t.TempDir(), "validation.json")
+	evidencePath := filepath.Join(t.TempDir(), "evidence.txt")
+	writeReviewCLIJSON(t, validationPath, facadeValidationResult{
+		OriginalCriteria:     facadeValidationCheck{Passed: false, Evidence: []string{"original acceptance test still fails"}},
+		CorrectionRegression: facadeValidationCheck{Passed: true, Evidence: []string{"unchanged candidate introduces no correction regression"}},
+		FollowUps:            []reviewtransaction.FollowUp{},
+	})
+	finalEvidence := []byte("targeted validator confirms bounded correction cannot be made safely\n")
+	if err := os.WriteFile(evidencePath, finalEvidence, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--validation", validationPath, "--evidence", evidencePath, "--failed"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	finalized := decodeFacadeFinalize(t, output.Bytes())
+	if finalized.State != reviewtransaction.StateEscalated || finalized.ReceiptPath != store.ReceiptPath() {
+		t.Fatalf("zero-edit finalize result = %#v", finalized)
+	}
+	terminal, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.Revision == forecasted.Revision || terminal.State.ZeroEditEscalation == nil ||
+		terminal.State.ZeroEditEscalation.Reason != reviewtransaction.CompactZeroEditEscalationReason ||
+		terminal.State.ZeroEditEscalation.ActualLines != 0 || terminal.State.ZeroEditEscalation.OriginalCriteria.Passed ||
+		!terminal.State.ZeroEditEscalation.CorrectionRegression.Passed || terminal.State.ActualCorrectionLines != nil ||
+		terminal.State.FixDeltaHash != reviewtransaction.EmptyFixDeltaHash || len(terminal.State.CorrectionAttempts) != 0 ||
+		terminal.State.CurrentSnapshot.CandidateTree != terminal.State.InitialSnapshot.CandidateTree || terminal.State.EvidenceHash == "" ||
+		terminal.State.ZeroEditEscalation.OriginalCriteria.FixDeltaHash != terminal.State.ZeroEditEscalation.FixDeltaHash ||
+		terminal.State.ZeroEditEscalation.CorrectionRegression.FixDeltaHash != terminal.State.ZeroEditEscalation.FixDeltaHash ||
+		terminal.State.ProposedCorrectionLines == nil || *terminal.State.ProposedCorrectionLines != 65 ||
+		terminal.State.CorrectionBudget != forecasted.State.CorrectionBudget ||
+		!reflect.DeepEqual(terminal.State.Findings, forecasted.State.Findings) ||
+		!reflect.DeepEqual(terminal.State.Outcomes, forecasted.State.Outcomes) ||
+		!reflect.DeepEqual(terminal.State.FixFindingIDs, forecasted.State.FixFindingIDs) {
+		t.Fatalf("zero-edit terminal authority = %#v", terminal.State)
+	}
+	receiptPayload, err := os.ReadFile(store.ReceiptPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := reviewtransaction.ParseCompactReceipt(receiptPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.TerminalState != reviewtransaction.TerminalEscalated || receipt.FinalCandidateTree != terminal.State.InitialSnapshot.CandidateTree ||
+		receipt.FixDeltaHash != reviewtransaction.EmptyFixDeltaHash || receipt.EvidenceHash != terminal.State.EvidenceHash {
+		t.Fatalf("zero-edit terminal receipt = %#v", receipt)
+	}
+
+	output.Reset()
+	if err := RunReview([]string{
+		"recover", "--cwd", repo, "--predecessor-lineage", started.LineageID,
+		"--expected-predecessor-revision", terminal.Revision, "--successor-lineage", "zero-edit-recovered",
+		"--disposition", "escalated", "--reason", "maintainer accepted successor review", "--actor", "maintainer",
+		"--maintainer-authorization", "incident-42",
+	}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var recovered ReviewRecoverResult
+	if err := json.Unmarshal(output.Bytes(), &recovered); err != nil {
+		t.Fatal(err)
+	}
+	if recovered.LineageID != "zero-edit-recovered" || recovered.State != reviewtransaction.StateReviewing ||
+		recovered.Recovery.Disposition != reviewtransaction.RecoveryEscalated || recovered.Recovery.PredecessorRevision != terminal.Revision {
+		t.Fatalf("zero-edit recovery = %#v", recovered)
+	}
+	unchangedPredecessor, err := store.Load()
+	if err != nil || unchangedPredecessor.Revision != terminal.Revision || unchangedPredecessor.State.ZeroEditEscalation == nil {
+		t.Fatalf("recovery changed zero-edit predecessor = %#v, %v", unchangedPredecessor, err)
+	}
+}
+
 func TestReviewFacadeFinalizeRejectsCorrectionCreatedUntrackedPath(t *testing.T) {
 	repo := initReviewCLIRepo(t)
 	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\none\ntwo\nthree\nfour\n"), 0o644); err != nil {
