@@ -120,6 +120,43 @@ func TestNegotiatedReviewStatusReportsFreshStartAndPreservesGlobalStatus(t *test
 	}
 }
 
+func TestReviewTargetStatusProjectionRequiresCanonicalGitPaths(t *testing.T) {
+	validProjection := ReviewTargetStatusProjection{
+		Schema:                  ReviewIntegrationProjectionSchema,
+		Kind:                    reviewtransaction.TargetCurrentChanges,
+		Projection:              reviewtransaction.ProjectionWorkspace,
+		BaseTree:                strings.Repeat("a", 40),
+		InitialReviewTree:       strings.Repeat("b", 40),
+		CurrentCandidateTree:    strings.Repeat("c", 40),
+		PathsDigest:             "sha256:" + strings.Repeat("d", 64),
+		Paths:                   []string{"internal/cli/review_status_contract.go"},
+		IntendedUntracked:       []string{},
+		IntendedUntrackedProof:  "sha256:" + strings.Repeat("e", 64),
+		InitialSnapshotIdentity: "sha256:" + strings.Repeat("f", 64),
+		CurrentSnapshotIdentity: "sha256:" + strings.Repeat("0", 64),
+	}
+	if err := validProjection.Validate(); err != nil {
+		t.Fatalf("canonical slash-separated Git path rejected: %v", err)
+	}
+
+	for _, invalidPath := range []string{
+		"/absolute/path",
+		"C:/absolute/path",
+		"../traversal",
+		"internal/../contract.go",
+		"internal//contract.go",
+		`internal\contract.go`,
+	} {
+		t.Run(invalidPath, func(t *testing.T) {
+			projection := validProjection
+			projection.Paths = []string{invalidPath}
+			if err := projection.Validate(); err == nil {
+				t.Fatalf("non-canonical Git path %q was accepted", invalidPath)
+			}
+		})
+	}
+}
+
 func TestNegotiatedReviewStatusContractAndSchemasAreStrict(t *testing.T) {
 	repo := initReviewCLIRepo(t)
 	var output bytes.Buffer

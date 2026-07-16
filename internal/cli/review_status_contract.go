@@ -3,7 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
+	"path"
 	"reflect"
 	"strings"
 
@@ -202,7 +202,7 @@ func (projection ReviewTargetStatusProjection) Validate() error {
 	}
 	for _, paths := range [][]string{projection.Paths, projection.IntendedUntracked} {
 		for _, path := range paths {
-			if path == "" || filepath.IsAbs(path) || filepath.Clean(path) != path || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
+			if !validReviewStatusGitPath(path) {
 				return fmt.Errorf("restart projection path %q is not repository-relative", path)
 			}
 		}
@@ -214,6 +214,15 @@ func (projection ReviewTargetStatusProjection) Validate() error {
 		return errors.New("restart projection paths are not canonical")
 	}
 	return nil
+}
+
+func validReviewStatusGitPath(value string) bool {
+	if value == "" || strings.Contains(value, `\`) || path.IsAbs(value) || path.Clean(value) != value ||
+		value == ".." || strings.HasPrefix(value, "../") {
+		return false
+	}
+	return len(value) < 2 || value[1] != ':' ||
+		(value[0] < 'a' || value[0] > 'z') && (value[0] < 'A' || value[0] > 'Z')
 }
 
 func sortedReviewStatusStrings(values []string) []string {
