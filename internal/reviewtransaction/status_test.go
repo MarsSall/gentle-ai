@@ -164,6 +164,53 @@ func TestInventoryAuthorityRejectsAmbiguousLockEvidence(t *testing.T) {
 	}
 }
 
+func TestInventoryAuthorityReportsValidInvalidatedAuthority(t *testing.T) {
+	for _, fixture := range []struct {
+		name    string
+		lineage string
+		write   func(t *testing.T, repo, lineage string)
+	}{
+		{name: "compact", lineage: "compact-invalidated", write: writeCompactInvalidatedAuthority},
+		{name: "legacy", lineage: "legacy-invalidated", write: writeLegacyInvalidatedAuthority},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			repo := initSnapshotRepo(t)
+			writeSnapshotFile(t, repo, "tracked.txt", "candidate\n")
+			fixture.write(t, repo, fixture.lineage)
+
+			report, err := InventoryAuthority(context.Background(), repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !report.Complete || !report.Authoritative || report.Status != AuthorityStatusInvalidated ||
+				len(report.Entries) != 1 || report.Entries[0].Status != AuthorityStatusInvalidated ||
+				report.Entries[0].State != StateInvalidated || len(report.Entries[0].Problems) != 0 {
+				t.Fatalf("valid invalidated authority report = %#v", report)
+			}
+		})
+	}
+}
+
+func TestInventoryAuthorityAggregatesValidInvalidatedAuthorities(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "candidate\n")
+	writeCompactInvalidatedAuthority(t, repo, "compact-invalidated")
+	writeLegacyInvalidatedAuthority(t, repo, "legacy-invalidated")
+
+	report, err := InventoryAuthority(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Complete || !report.Authoritative || report.Status != AuthorityStatusInvalidated || len(report.Entries) != 2 {
+		t.Fatalf("invalidated aggregate report = %#v", report)
+	}
+	for _, entry := range report.Entries {
+		if entry.Status != AuthorityStatusInvalidated || entry.State != StateInvalidated || len(entry.Problems) != 0 {
+			t.Fatalf("invalidated aggregate entry = %#v", entry)
+		}
+	}
+}
+
 func TestInventoryAuthorityReportsRecoveredSuccessorAndSupersededPredecessor(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	writeSnapshotFile(t, repo, "tracked.txt", "candidate\n")
@@ -240,6 +287,54 @@ func TestInventoryAuthorityReportsRecoveredInvalidatedSuccessorAndSupersededPred
 	if !report.Complete || !report.Authoritative || !hasAuthorityInventoryStatus(report.Entries, predecessor.LineageID, AuthorityStatusSuperseded) ||
 		!hasAuthorityInventoryStatus(report.Entries, successor.LineageID, AuthorityStatusRecovered) {
 		t.Fatalf("invalidated recovery report = %#v", report)
+	}
+}
+
+func writeCompactInvalidatedAuthority(t *testing.T, repo, lineage string) {
+	t.Helper()
+	state := newCompactTestState(t, repo, lineage)
+	store, err := CompactAuthoritativeStore(context.Background(), repo, lineage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := store.Replace("", "review/start", state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Invalidate("candidate no longer applies"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Replace(revision, "review/invalidate", state); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeLegacyInvalidatedAuthority(t *testing.T, repo, lineage string) {
+	t.Helper()
+	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction, err := NewTransaction(Start{LineageID: lineage, Mode: ModeOrdinary4R, Generation: 1, Snapshot: snapshot, PolicyHash: hash("a")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.StartReview(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := AuthoritativeStore(context.Background(), repo, lineage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := store.Append("", Record{Operation: "review/start", Transaction: *transaction})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.Invalidate("candidate no longer applies"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Store{Dir: store.Dir}).Append(revision, Record{Operation: "review/invalidate", Transaction: *transaction}); err != nil {
+		t.Fatal(err)
 	}
 }
 

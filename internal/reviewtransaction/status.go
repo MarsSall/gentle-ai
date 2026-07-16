@@ -17,15 +17,16 @@ const ReviewAuthorityStatusSchema = "gentle-ai.review-authority-status/v1"
 type AuthorityStatus string
 
 const (
-	AuthorityStatusClean      AuthorityStatus = "clean"
-	AuthorityStatusActive     AuthorityStatus = "active"
-	AuthorityStatusApproved   AuthorityStatus = "approved"
-	AuthorityStatusEscalated  AuthorityStatus = "escalated"
-	AuthorityStatusInvalid    AuthorityStatus = "invalid"
-	AuthorityStatusReset      AuthorityStatus = "reset-in-progress"
-	AuthorityStatusSuperseded AuthorityStatus = "superseded"
-	AuthorityStatusRecovered  AuthorityStatus = "recovered"
-	AuthorityStatusCollision  AuthorityStatus = "same-lineage-mixed-collision"
+	AuthorityStatusClean       AuthorityStatus = "clean"
+	AuthorityStatusActive      AuthorityStatus = "active"
+	AuthorityStatusApproved    AuthorityStatus = "approved"
+	AuthorityStatusEscalated   AuthorityStatus = "escalated"
+	AuthorityStatusInvalidated AuthorityStatus = "invalidated"
+	AuthorityStatusInvalid     AuthorityStatus = "invalid"
+	AuthorityStatusReset       AuthorityStatus = "reset-in-progress"
+	AuthorityStatusSuperseded  AuthorityStatus = "superseded"
+	AuthorityStatusRecovered   AuthorityStatus = "recovered"
+	AuthorityStatusCollision   AuthorityStatus = "same-lineage-mixed-collision"
 )
 
 type AuthorityVersion string
@@ -131,10 +132,8 @@ func InventoryAuthority(ctx context.Context, repo string) (AuthorityStatusReport
 		report.Status = AuthorityStatusClean
 	} else if !report.Complete {
 		report.Status = AuthorityStatusInvalid
-	} else if len(report.Entries) == 1 {
-		report.Status = report.Entries[0].Status
 	} else {
-		report.Status = AuthorityStatusActive
+		report.Status = aggregateAuthorityStatus(report.Entries)
 	}
 	return report, nil
 }
@@ -275,7 +274,7 @@ func authorityStatusForState(state State) AuthorityStatus {
 	case StateEscalated:
 		return AuthorityStatusEscalated
 	case StateInvalidated:
-		return AuthorityStatusInvalid
+		return AuthorityStatusInvalidated
 	default:
 		return AuthorityStatusActive
 	}
@@ -310,13 +309,22 @@ func inventoryLock(version AuthorityVersion, lineage, path string) (AuthorityLoc
 	return lock, true
 }
 
+func aggregateAuthorityStatus(entries []AuthorityInventoryEntry) AuthorityStatus {
+	status := entries[0].Status
+	for _, entry := range entries[1:] {
+		if entry.Status != status {
+			return AuthorityStatusActive
+		}
+	}
+	return status
+}
+
 func markCompactGraph(report *AuthorityStatusReport) {
 	byLineage := map[string]int{}
 	children := map[string][]int{}
 	for index := range report.Entries {
 		entry := &report.Entries[index]
-		if entry.Version == AuthorityVersionCompact && entry.Status != AuthorityStatusReset &&
-			(entry.Status != AuthorityStatusInvalid || entry.State == StateInvalidated && len(entry.Problems) == 0) {
+		if entry.Version == AuthorityVersionCompact && entry.Status != AuthorityStatusReset && entry.Status != AuthorityStatusInvalid {
 			byLineage[entry.LineageID] = index
 		}
 	}
@@ -347,8 +355,7 @@ func markCompactGraph(report *AuthorityStatusReport) {
 			}
 			continue
 		}
-		if predecessor, ok := byLineage[lineage]; ok && (report.Entries[predecessor].Status != AuthorityStatusInvalid ||
-			report.Entries[predecessor].State == StateInvalidated && len(report.Entries[predecessor].Problems) == 0) {
+		if predecessor, ok := byLineage[lineage]; ok && report.Entries[predecessor].Status != AuthorityStatusInvalid {
 			report.Entries[predecessor].Status = AuthorityStatusSuperseded
 		}
 	}
