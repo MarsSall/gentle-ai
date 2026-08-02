@@ -107,6 +107,10 @@ type sddStatusV1 struct {
 		Completed   int  `json:"completed"`
 		AllComplete bool `json:"allComplete"`
 	} `json:"taskProgress"`
+	RemediationState struct {
+		Required               bool   `json:"required"`
+		FailedEvidenceRevision string `json:"failedEvidenceRevision"`
+	} `json:"remediationState"`
 }
 
 // gateResult is the subset of a lifecycle gate envelope the proofs read.
