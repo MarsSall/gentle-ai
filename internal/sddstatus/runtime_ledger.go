@@ -35,6 +35,7 @@ const (
 	runtimeOperationBegin             = "attempt/begin"
 	runtimeOperationFinish            = "attempt/finish"
 	runtimeOperationFinishRemediation = "attempt/finish-remediation"
+	runtimeOperationFinishUnmanaged   = "attempt/finish-unmanaged-remediation"
 	runtimeOperationReset             = "objective/reset"
 	runtimeOperationBind              = "binding/set"
 	runtimeLockAcquireAttempts        = 3
@@ -159,6 +160,10 @@ const (
 	HarnessInvalidated HarnessDisposition = "invalidated"
 )
 
+type ResetDisposition string
+
+const ResetDispositionFailedEvidenceRemediation ResetDisposition = "failed-evidence-remediation"
+
 type RuntimeObjective struct {
 	ID                       string `json:"id"`
 	Generation               int    `json:"generation"`
@@ -191,13 +196,19 @@ type RuntimeAttempt struct {
 }
 
 type RuntimeReset struct {
-	Revision               string `json:"revision"`
-	PreviousObjectiveID    string `json:"previous_objective_id"`
-	PreviousGeneration     int    `json:"previous_generation"`
-	ResetCandidateIdentity string `json:"reset_candidate_identity"`
-	ResetCandidateTree     string `json:"reset_candidate_tree"`
-	Reason                 string `json:"reason"`
-	Actor                  string `json:"actor"`
+	Revision                   string           `json:"revision"`
+	PreviousObjectiveID        string           `json:"previous_objective_id"`
+	PreviousGeneration         int              `json:"previous_generation"`
+	ResetCandidateIdentity     string           `json:"reset_candidate_identity"`
+	ResetCandidateTree         string           `json:"reset_candidate_tree"`
+	Reason                     string           `json:"reason"`
+	Actor                      string           `json:"actor"`
+	Disposition                ResetDisposition `json:"disposition,omitempty"`
+	RemediatesEvidenceRevision string           `json:"remediates_evidence_revision,omitempty"`
+	WorkUnit                   string           `json:"work_unit,omitempty"`
+	EvidenceGoal               string           `json:"evidence_goal,omitempty"`
+	MaxAttempts                int              `json:"max_attempts,omitempty"`
+	MaxChangedLines            int              `json:"max_changed_lines,omitempty"`
 }
 
 type RuntimeStatus struct {
@@ -246,10 +257,16 @@ type FinishAttemptRequest struct {
 }
 
 type ResetObjectiveRequest struct {
-	ExpectedRevision string `json:"expected_revision"`
-	RequestID        string `json:"request_id"`
-	Reason           string `json:"reason"`
-	Actor            string `json:"actor"`
+	ExpectedRevision           string           `json:"expected_revision"`
+	RequestID                  string           `json:"request_id"`
+	Reason                     string           `json:"reason"`
+	Actor                      string           `json:"actor"`
+	Disposition                ResetDisposition `json:"disposition,omitempty"`
+	RemediatesEvidenceRevision string           `json:"remediates_evidence_revision,omitempty"`
+	WorkUnit                   string           `json:"work_unit,omitempty"`
+	EvidenceGoal               string           `json:"evidence_goal,omitempty"`
+	MaxChangedLines            int              `json:"max_changed_lines,omitempty"`
+	MaintainerAuthorization    string           `json:"maintainer_authorization,omitempty"`
 }
 
 // BindReviewRequest performs a binding-only compare-and-swap. The expected
@@ -284,8 +301,10 @@ type RuntimeStore struct {
 	// keeps today's behavior. The switch itself is read in the CLI layer, which
 	// owns the single source of truth for both of its sources; an unreadable
 	// switch is not a disabled switch and resolves to false.
-	ReviewDisabled bool
-	commonDir      string
+	ReviewDisabled              bool
+	ReviewDisabledCheck         func() (bool, error)
+	RequireUnmanagedEligibility bool
+	commonDir                   string
 }
 
 type runtimeRecord struct {
@@ -314,12 +333,19 @@ type runtimeBeginEvent struct {
 }
 
 type runtimeResetEvent struct {
-	PreviousObjectiveID    string `json:"previous_objective_id"`
-	PreviousGeneration     int    `json:"previous_generation"`
-	ResetCandidateIdentity string `json:"reset_candidate_identity"`
-	ResetCandidateTree     string `json:"reset_candidate_tree"`
-	Reason                 string `json:"reason"`
-	Actor                  string `json:"actor"`
+	PreviousObjectiveID        string           `json:"previous_objective_id"`
+	PreviousGeneration         int              `json:"previous_generation"`
+	ResetCandidateIdentity     string           `json:"reset_candidate_identity"`
+	ResetCandidateTree         string           `json:"reset_candidate_tree"`
+	Reason                     string           `json:"reason"`
+	Actor                      string           `json:"actor"`
+	Disposition                ResetDisposition `json:"disposition,omitempty"`
+	RemediatesEvidenceRevision string           `json:"remediates_evidence_revision,omitempty"`
+	WorkUnit                   string           `json:"work_unit,omitempty"`
+	EvidenceGoal               string           `json:"evidence_goal,omitempty"`
+	MaxAttempts                int              `json:"max_attempts,omitempty"`
+	MaxChangedLines            int              `json:"max_changed_lines,omitempty"`
+	MaintainerAuthorization    string           `json:"maintainer_authorization,omitempty"`
 }
 
 type runtimeFinishEvent struct {
@@ -355,9 +381,10 @@ type runtimeRequestReceipt struct {
 }
 
 type runtimeReplay struct {
-	Status        RuntimeStatus
-	Requests      map[string]runtimeRequestReceipt
-	AttemptTokens map[int]string
+	Status                 RuntimeStatus
+	Requests               map[string]runtimeRequestReceipt
+	AttemptTokens          map[int]string
+	UnmanagedAuthorization *runtimeResetEvent
 }
 
 func OpenRuntimeStore(ctx context.Context, repo, change string) (RuntimeStore, error) {
@@ -407,6 +434,17 @@ func (store RuntimeStore) Begin(ctx context.Context, request BeginAttemptRequest
 		if status.DecisionRequired {
 			return runtimeRecord{}, ErrRuntimeBudgetExhausted
 		}
+		if replay.UnmanagedAuthorization != nil {
+			disabled, modeErr := store.reviewDisabled()
+			if modeErr != nil || !disabled {
+				return runtimeRecord{}, errors.New("unmanaged SDD remediation requires a readable disabled review mode") // refusal:by-design world-action: review mode state must be repaired or disabled before unmanaged authority can be used
+			}
+			authorization := replay.UnmanagedAuthorization
+			if request.WorkUnit != authorization.WorkUnit || request.EvidenceGoal != authorization.EvidenceGoal ||
+				request.MaxAttempts != 1 || request.MaxChangedLines != authorization.MaxChangedLines {
+				return runtimeRecord{}, errors.New("unmanaged SDD remediation begin does not match its authorized scope") // refusal:by-design operator-knowledge: the caller must submit the exact scope from the maintainer authorization
+			}
+		}
 
 		generation := status.ObjectiveGeneration + 1
 		var snapshot reviewtransaction.Snapshot
@@ -430,11 +468,18 @@ func (store RuntimeStore) Begin(ctx context.Context, request BeginAttemptRequest
 			if err == nil && (snapshot.Identity != last.FinishCandidateIdentity || snapshot.CandidateTree != last.FinishCandidateTree) {
 				return runtimeRecord{}, store.runtimeObjectiveChangeRefusal(ctx, status)
 			}
+		} else if replay.UnmanagedAuthorization != nil {
+			last := status.Attempts[len(status.Attempts)-1]
+			snapshot, err = captureRuntimeTerminalCandidate(ctx, store, last.BeginCandidateTree)
 		} else {
 			snapshot, err = captureRuntimeCandidate(ctx, store.Repo)
 		}
 		if err != nil {
 			return runtimeRecord{}, fmt.Errorf("capture SDD runtime candidate before launch: %w", err)
+		}
+		if authorization := replay.UnmanagedAuthorization; authorization != nil &&
+			(snapshot.Identity != authorization.ResetCandidateIdentity || snapshot.CandidateTree != authorization.ResetCandidateTree) {
+			return runtimeRecord{}, errors.New("unmanaged SDD remediation candidate changed after authorization") // refusal:by-design world-action: candidate drift invalidated the immutable authorization and must be restored or freshly authorized
 		}
 		objectiveID := runtimeObjectiveID(store.Change, request.WorkUnit, request.EvidenceGoal, snapshot.Identity, generation)
 		if status.Objective != nil {
@@ -463,6 +508,16 @@ func (store RuntimeStore) Finish(ctx context.Context, request FinishAttemptReque
 		active := status.ActiveAttempt
 		if active == nil {
 			return runtimeRecord{}, ErrRuntimeNoActiveAttempt
+		}
+		unmanaged := replay.UnmanagedAuthorization != nil
+		if unmanaged {
+			disabled, modeErr := store.reviewDisabled()
+			if modeErr != nil || !disabled {
+				return runtimeRecord{}, errors.New("unmanaged SDD remediation requires a readable disabled review mode") // refusal:by-design world-action: review mode state must be repaired or disabled before unmanaged authority can be used
+			}
+			if finishRequestsRemediation(request) {
+				return runtimeRecord{}, errors.New("unmanaged SDD remediation cannot name review authority") // refusal:by-design operator-knowledge: the caller must omit review-authority fields from the unmanaged finish request
+			}
 		}
 		remediation := finishRequestsRemediation(request)
 		currentBinding := status.Binding
@@ -507,7 +562,8 @@ func (store RuntimeStore) Finish(ctx context.Context, request FinishAttemptReque
 		// a safeguard. Re-enabling re-validates from the current state, because
 		// the binding still refers to the candidate it was approved for and the
 		// next enforcement point rediscovers that on its own.
-		if request.Outcome == AttemptPassed && currentBinding != nil && !remediation && !store.ReviewDisabled {
+		reviewDisabled, _ := store.reviewDisabled()
+		if request.Outcome == AttemptPassed && currentBinding != nil && !remediation && !reviewDisabled {
 			if snapshot.CandidateTree != active.BeginCandidateTree {
 				return runtimeRecord{}, store.runtimeRemediationExitRefusal(ctx, status, *currentBinding, active.Ordinal, snapshot.CandidateTree)
 			}
@@ -525,6 +581,15 @@ func (store RuntimeStore) Finish(ctx context.Context, request FinishAttemptReque
 			CleanupEvidence: request.CleanupEvidence, ProcessEvidence: request.ProcessEvidence,
 			RemediatesEvidenceRevision: request.RemediatesEvidenceRevision,
 			ChangedLineBudgetExceeded:  status.CumulativeChangedLines+changedLines > status.Objective.MaxChangedLines,
+		}
+		if unmanaged {
+			authorization := replay.UnmanagedAuthorization
+			event.RemediatesEvidenceRevision = authorization.RemediatesEvidenceRevision
+			if request.Outcome == AttemptPassed && (changedLines == 0 || snapshot.CandidateTree == active.BeginCandidateTree ||
+				request.EvidenceRevision == authorization.RemediatesEvidenceRevision) {
+				return runtimeRecord{}, errors.New("passing unmanaged SDD remediation requires a changed candidate, positive line charge, and distinct evidence") // refusal:by-design world-action: the candidate and evidence must materially change before remediation can pass
+			}
+			return runtimeRecord{Operation: runtimeOperationFinishUnmanaged, Finish: event}, nil
 		}
 		if remediation {
 			prepared, prepareErr := prepareApprovedRuntimeSuccessorBinding(ctx, store.Repo, store.Workspace, store.Change, request.SuccessorLineageID)
@@ -743,10 +808,30 @@ func (store RuntimeStore) Reset(ctx context.Context, request ResetObjectiveReque
 		if status.Objective == nil {
 			return runtimeRecord{}, ErrRuntimeNoObjective
 		}
+		if unmanagedRemediationConsumed(status) {
+			return runtimeRecord{}, ErrRuntimeResetNotAllowed
+		}
 		if !runtimeResetStructurallyPermitted(status) {
 			return runtimeRecord{}, ErrRuntimeResetNotAllowed
 		}
-		if !status.DecisionRequired && !status.Complete {
+		if request.Disposition == ResetDispositionFailedEvidenceRemediation {
+			disabled, modeErr := store.reviewDisabled()
+			if modeErr != nil || !disabled || status.Binding != nil || len(status.Attempts) == 0 {
+				return runtimeRecord{}, errors.New("unmanaged SDD remediation authorization is not eligible") // refusal:by-design world-action: runtime and review state must reach the exact disabled failed-evidence boundary before authorization
+			}
+			last := status.Attempts[len(status.Attempts)-1]
+			if last.Outcome != AttemptFailed || last.ObjectiveID != status.Objective.ID ||
+				last.ObjectiveGeneration != status.Objective.Generation || last.EvidenceRevision != request.RemediatesEvidenceRevision {
+				return runtimeRecord{}, errors.New("unmanaged SDD remediation does not match the terminal failed evidence") // refusal:by-design operator-knowledge: the caller must bind the reset to the exact terminal failed evidence revision
+			}
+			if store.RequireUnmanagedEligibility {
+				resolved, resolveErr := Resolve(ResolveOptions{CWD: store.Workspace, ChangeName: store.Change, ReviewDisabled: true})
+				if resolveErr != nil || resolved.RuntimeStatus == nil || resolved.RuntimeStatus.Revision != status.Revision ||
+					!resolved.RemediationState.Required || resolved.RemediationState.FailedEvidenceRevision != request.RemediatesEvidenceRevision {
+					return runtimeRecord{}, errors.New("unmanaged SDD remediation evidence and review state are not eligible") // refusal:by-design world-action: live runtime and review state must satisfy the unmanaged-remediation eligibility boundary
+				}
+			}
+		} else if !status.DecisionRequired && !status.Complete {
 			// The only remaining structurally-permitted scope is a terminal
 			// failed/interrupted attempt with budget still available: begin
 			// is the ordinary continuation here, so admit reset only when
@@ -762,15 +847,39 @@ func (store RuntimeStore) Reset(ctx context.Context, request ResetObjectiveReque
 				return runtimeRecord{}, ErrRuntimeResetNotAllowed
 			}
 		}
-		snapshot, err := captureRuntimeCandidate(ctx, store.Repo)
+		var snapshot reviewtransaction.Snapshot
+		if request.Disposition == ResetDispositionFailedEvidenceRemediation {
+			last := status.Attempts[len(status.Attempts)-1]
+			snapshot, err = captureRuntimeTerminalCandidate(ctx, store, last.BeginCandidateTree)
+		} else {
+			snapshot, err = captureRuntimeCandidate(ctx, store.Repo)
+		}
 		if err != nil {
 			return runtimeRecord{}, fmt.Errorf("capture SDD runtime candidate at objective reset: %w", err)
 		}
-		return runtimeRecord{Operation: runtimeOperationReset, Reset: &runtimeResetEvent{
+		if request.Disposition == ResetDispositionFailedEvidenceRemediation {
+			last := status.Attempts[len(status.Attempts)-1]
+			if snapshot.Identity != last.FinishCandidateIdentity || snapshot.CandidateTree != last.FinishCandidateTree {
+				return runtimeRecord{}, errors.New("unmanaged SDD remediation failed candidate no longer matches the workspace") // refusal:by-design world-action: workspace drift must be restored before the failed candidate can be authorized
+			}
+			if request.MaintainerAuthorization != renderUnmanagedRemediationAuthorization(status.Revision, store.Change, *status.Objective, last,
+				request.WorkUnit, request.EvidenceGoal, request.MaxChangedLines, request.Actor, request.Reason) {
+				return runtimeRecord{}, errors.New("unmanaged SDD remediation maintainer authorization does not match the exact binding") // refusal:by-design human-authority: only a maintainer can issue the exact authorization for this immutable reset binding
+			}
+		}
+		event := &runtimeResetEvent{
 			PreviousObjectiveID: status.Objective.ID, PreviousGeneration: status.Objective.Generation,
 			ResetCandidateIdentity: snapshot.Identity, ResetCandidateTree: snapshot.CandidateTree,
 			Reason: request.Reason, Actor: request.Actor,
-		}}, nil
+		}
+		if request.Disposition == ResetDispositionFailedEvidenceRemediation {
+			event.Disposition = request.Disposition
+			event.RemediatesEvidenceRevision = request.RemediatesEvidenceRevision
+			event.WorkUnit, event.EvidenceGoal = request.WorkUnit, request.EvidenceGoal
+			event.MaxAttempts, event.MaxChangedLines = 1, request.MaxChangedLines
+			event.MaintainerAuthorization = request.MaintainerAuthorization
+		}
+		return runtimeRecord{Operation: runtimeOperationReset, Reset: event}, nil
 	})
 }
 
@@ -1065,6 +1174,12 @@ func applyRuntimeRecord(replay *runtimeReplay, revision string, record runtimeRe
 		if replay.Status.ActiveAttempt != nil || replay.Status.Complete || replay.Status.DecisionRequired {
 			return errors.New("begin record is not a valid successor")
 		}
+		if authorization := replay.UnmanagedAuthorization; authorization != nil &&
+			(event.WorkUnit != authorization.WorkUnit || event.EvidenceGoal != authorization.EvidenceGoal || event.MaxAttempts != 1 ||
+				event.MaxChangedLines != authorization.MaxChangedLines || event.BeginCandidateIdentity != authorization.ResetCandidateIdentity ||
+				event.BeginCandidateTree != authorization.ResetCandidateTree || generation != authorization.PreviousGeneration+1) {
+			return errors.New("begin record does not match unmanaged remediation authorization") // refusal:by-design world-action: contradictory persisted ledger authority requires code or storage repair
+		}
 		if replay.Status.Objective == nil {
 			expectedObjectiveID := runtimeObjectiveID(record.Change, event.WorkUnit, event.EvidenceGoal, event.BeginCandidateIdentity, generation)
 			if event.ObjectiveGeneration == 0 {
@@ -1132,8 +1247,6 @@ func applyRuntimeRecord(replay *runtimeReplay, revision string, record runtimeRe
 		}
 		if record.Binding.Current.Lineage == currentBinding.Lineage &&
 			record.Finish.EvidenceRevision == record.Finish.RemediatesEvidenceRevision {
-			// A same-lineage record is a legal approved self-successor only when
-			// its corrected evidence differs from the failed evidence it repairs.
 			return errors.New("atomic remediation binding does not select a distinct successor or corrected self-successor")
 		}
 		if err := applyRuntimeFinishEvent(replay, record.Finish); err != nil {
@@ -1145,15 +1258,51 @@ func applyRuntimeRecord(replay *runtimeReplay, revision string, record runtimeRe
 			}
 		}
 
+	case runtimeOperationFinishUnmanaged:
+		if replay.UnmanagedAuthorization == nil {
+			return errors.New("unmanaged remediation finish has no authorization") // refusal:by-design world-action: a persisted unmanaged finish without its preceding authority requires code or storage repair
+		}
+		authorization := replay.UnmanagedAuthorization
+		if replay.Status.ActiveAttempt == nil || record.Finish.RemediatesEvidenceRevision != authorization.RemediatesEvidenceRevision || replay.Status.Objective == nil ||
+			replay.Status.Objective.Generation != authorization.PreviousGeneration+1 || replay.Status.Objective.WorkUnit != authorization.WorkUnit ||
+			replay.Status.Objective.EvidenceGoal != authorization.EvidenceGoal || replay.Status.Objective.MaxAttempts != 1 ||
+			replay.Status.Objective.MaxChangedLines != authorization.MaxChangedLines {
+			return errors.New("unmanaged remediation finish does not match its authorization") // refusal:by-design world-action: contradictory persisted finish authority requires code or storage repair
+		}
+		if record.Finish.Outcome == AttemptPassed && (record.Finish.ChangedLines == 0 ||
+			record.Finish.FinishCandidateTree == replay.Status.ActiveAttempt.BeginCandidateTree ||
+			record.Finish.EvidenceRevision == authorization.RemediatesEvidenceRevision) {
+			return errors.New("passing unmanaged remediation has invalid correction evidence") // refusal:by-design world-action: contradictory persisted correction evidence requires code or storage repair
+		}
+		if err := applyRuntimeFinishEvent(replay, record.Finish); err != nil {
+			return err
+		}
+		replay.UnmanagedAuthorization = nil
+
 	case runtimeOperationReset:
 		event := record.Reset
 		objective := replay.Status.Objective
-		if replay.Status.ActiveAttempt != nil || objective == nil || !runtimeResetStructurallyPermitted(replay.Status) {
+		if replay.Status.ActiveAttempt != nil || objective == nil || unmanagedRemediationConsumed(replay.Status) || !runtimeResetStructurallyPermitted(replay.Status) {
 			return errors.New("objective reset is not a valid successor")
 		}
 		if event.PreviousObjectiveID != objective.ID || event.PreviousGeneration != objective.Generation ||
 			event.PreviousGeneration != replay.Status.ObjectiveGeneration {
 			return errors.New("objective reset does not match the terminal objective")
+		}
+		if event.Disposition == ResetDispositionFailedEvidenceRemediation {
+			if replay.Status.Binding != nil || len(replay.Status.Attempts) == 0 {
+				return errors.New("unmanaged remediation reset has ineligible authority state") // refusal:by-design world-action: contradictory persisted reset authority requires code or storage repair
+			}
+			last := replay.Status.Attempts[len(replay.Status.Attempts)-1]
+			if last.Outcome != AttemptFailed || last.ObjectiveID != objective.ID || last.ObjectiveGeneration != objective.Generation ||
+				last.EvidenceRevision != event.RemediatesEvidenceRevision || last.FinishCandidateIdentity != event.ResetCandidateIdentity ||
+				last.FinishCandidateTree != event.ResetCandidateTree {
+				return errors.New("unmanaged remediation reset does not match failed candidate evidence") // refusal:by-design world-action: contradictory persisted candidate evidence requires code or storage repair
+			}
+			if event.MaintainerAuthorization != renderUnmanagedRemediationAuthorization(record.PreviousRevision, record.Change, *objective, last,
+				event.WorkUnit, event.EvidenceGoal, event.MaxChangedLines, event.Actor, event.Reason) {
+				return errors.New("unmanaged remediation reset has an invalid exact authorization binding") // refusal:by-design world-action: a corrupted persisted authorization binding requires code or storage repair
+			}
 		}
 		replay.Status.Objective = nil
 		replay.Status.CumulativeAttempts = 0
@@ -1165,7 +1314,12 @@ func applyRuntimeRecord(replay *runtimeReplay, revision string, record runtimeRe
 		replay.Status.LastReset = &RuntimeReset{
 			Revision: revision, PreviousObjectiveID: event.PreviousObjectiveID, PreviousGeneration: event.PreviousGeneration,
 			ResetCandidateIdentity: event.ResetCandidateIdentity, ResetCandidateTree: event.ResetCandidateTree,
-			Reason: event.Reason, Actor: event.Actor,
+			Reason: event.Reason, Actor: event.Actor, Disposition: event.Disposition,
+			RemediatesEvidenceRevision: event.RemediatesEvidenceRevision, WorkUnit: event.WorkUnit,
+			EvidenceGoal: event.EvidenceGoal, MaxAttempts: event.MaxAttempts, MaxChangedLines: event.MaxChangedLines,
+		}
+		if event.Disposition == ResetDispositionFailedEvidenceRemediation {
+			replay.UnmanagedAuthorization = event
 		}
 
 	case runtimeOperationBind:
@@ -1326,6 +1480,25 @@ func validateRuntimeRecordShape(record runtimeRecord) error {
 		if runtimeValueHash("gentle-ai.sdd-runtime-finish-request/v1", request) != record.RequestDigest {
 			return errors.New("atomic SDD runtime remediation request digest does not match record")
 		}
+	case runtimeOperationFinishUnmanaged:
+		if record.Finish == nil || record.Begin != nil || record.Reset != nil || record.Binding != nil {
+			return errors.New("invalid unmanaged SDD remediation finish record shape") // refusal:by-design world-action: malformed persisted ledger structure requires code or storage repair
+		}
+		finish := record.Finish
+		if finish.Ordinal < 1 || !validTerminalAttemptOutcome(finish.Outcome) || finish.ChangedLines < 0 ||
+			finish.ChangedLines > maximumRuntimeChangedLines || !runtimeRevisionPattern.MatchString(finish.EvidenceRevision) ||
+			!runtimeRevisionPattern.MatchString(finish.RemediatesEvidenceRevision) ||
+			!runtimeRevisionPattern.MatchString(finish.FinishCandidateIdentity) || !runtimeGitTreePattern.MatchString(finish.FinishCandidateTree) ||
+			validateRuntimeText(finish.Diagnosis, 500) != nil || !validHarnessDisposition(finish.HarnessDisposition) ||
+			validateRuntimeText(finish.CleanupEvidence, 500) != nil || validateRuntimeText(finish.ProcessEvidence, 500) != nil {
+			return errors.New("invalid unmanaged SDD remediation finish event") // refusal:by-design world-action: malformed persisted finish evidence requires code or storage repair
+		}
+		request := FinishAttemptRequest{ExpectedRevision: record.PreviousRevision, RequestID: record.RequestID, Outcome: finish.Outcome,
+			EvidenceRevision: finish.EvidenceRevision, Diagnosis: finish.Diagnosis, HarnessDisposition: finish.HarnessDisposition,
+			CleanupEvidence: finish.CleanupEvidence, ProcessEvidence: finish.ProcessEvidence}
+		if runtimeValueHash("gentle-ai.sdd-runtime-finish-request/v1", request) != record.RequestDigest {
+			return errors.New("unmanaged SDD remediation finish request digest does not match record") // refusal:by-design world-action: tampered persisted request identity requires code or storage repair
+		}
 	case runtimeOperationReset:
 		if record.Reset == nil || record.Begin != nil || record.Finish != nil || record.Binding != nil {
 			return errors.New("invalid SDD runtime reset record shape")
@@ -1336,8 +1509,17 @@ func validateRuntimeRecordShape(record runtimeRecord) error {
 			validateRuntimeText(event.Reason, 500) != nil || validateRuntimeText(event.Actor, 128) != nil {
 			return errors.New("invalid SDD runtime reset event")
 		}
+		if event.Disposition != "" && (event.Disposition != ResetDispositionFailedEvidenceRemediation ||
+			!runtimeRevisionPattern.MatchString(event.RemediatesEvidenceRevision) || validateRuntimeText(event.WorkUnit, 160) != nil ||
+			validateRuntimeText(event.EvidenceGoal, 240) != nil || event.MaxAttempts != 1 || event.MaxChangedLines < 1 ||
+			event.MaxChangedLines > maximumRuntimeChangedLines || validateRuntimeAuthorization(event.MaintainerAuthorization) != nil) {
+			return errors.New("invalid unmanaged SDD remediation authorization") // refusal:by-design world-action: malformed persisted maintainer authority requires code or storage repair
+		}
 		request := ResetObjectiveRequest{
 			ExpectedRevision: record.PreviousRevision, RequestID: record.RequestID, Reason: event.Reason, Actor: event.Actor,
+			Disposition: event.Disposition, RemediatesEvidenceRevision: event.RemediatesEvidenceRevision,
+			WorkUnit: event.WorkUnit, EvidenceGoal: event.EvidenceGoal, MaxChangedLines: event.MaxChangedLines,
+			MaintainerAuthorization: event.MaintainerAuthorization,
 		}
 		if runtimeValueHash("gentle-ai.sdd-runtime-reset-request/v1", request) != record.RequestDigest {
 			return errors.New("SDD runtime reset request digest does not match record")
@@ -1471,6 +1653,31 @@ func normalizeResetObjectiveRequest(request ResetObjectiveRequest) (ResetObjecti
 	if err := validateRuntimeText(request.Actor, 128); err != nil {
 		return ResetObjectiveRequest{}, fmt.Errorf("invalid reset actor: %w", err)
 	}
+	if request.Disposition == "" {
+		if request.RemediatesEvidenceRevision != "" || request.WorkUnit != "" || request.EvidenceGoal != "" ||
+			request.MaxChangedLines != 0 || request.MaintainerAuthorization != "" {
+			return ResetObjectiveRequest{}, errors.New("reset remediation fields require disposition failed-evidence-remediation") // refusal:by-design operator-knowledge: the caller must pair remediation fields with the closed disposition value
+		}
+		return request, nil
+	}
+	if request.Disposition != ResetDispositionFailedEvidenceRemediation {
+		return ResetObjectiveRequest{}, errors.New("unsupported reset disposition") // refusal:by-design operator-knowledge: the caller must select the only supported remediation disposition
+	}
+	if !runtimeRevisionPattern.MatchString(request.RemediatesEvidenceRevision) {
+		return ResetObjectiveRequest{}, errors.New("remediates_evidence_revision must be sha256")
+	}
+	if err := validateRuntimeText(request.WorkUnit, 160); err != nil {
+		return ResetObjectiveRequest{}, fmt.Errorf("invalid remediation work_unit: %w", err)
+	}
+	if err := validateRuntimeText(request.EvidenceGoal, 240); err != nil {
+		return ResetObjectiveRequest{}, fmt.Errorf("invalid remediation evidence_goal: %w", err)
+	}
+	if request.MaxChangedLines < 1 || request.MaxChangedLines > maximumRuntimeChangedLines {
+		return ResetObjectiveRequest{}, fmt.Errorf("max_changed_lines must be within 1..%d", maximumRuntimeChangedLines)
+	}
+	if err := validateRuntimeAuthorization(request.MaintainerAuthorization); err != nil {
+		return ResetObjectiveRequest{}, errors.New("invalid maintainer authorization") // refusal:by-design human-authority: only the maintainer can supply a valid exact authorization statement
+	}
 	return request, nil
 }
 
@@ -1534,12 +1741,52 @@ func validateRuntimeText(value string, maximum int) error {
 	return nil
 }
 
+func validateRuntimeAuthorization(value string) error {
+	if value == "" || len(value) > 2048 || strings.TrimSpace(value) != value || strings.ContainsAny(value, "\r\x00") {
+		return errors.New("authorization must be non-empty, LF-only, trimmed, and bounded") // refusal:by-design operator-knowledge: the authorization producer must preserve the required canonical text encoding
+	}
+	return nil
+}
+
+func renderUnmanagedRemediationAuthorization(runtimeRevision, change string, objective RuntimeObjective, failed RuntimeAttempt,
+	workUnit, evidenceGoal string, maxChangedLines int, actor, reason string) string {
+	return strings.Join([]string{
+		"gentle-ai.sdd-unmanaged-remediation-authorization/v1",
+		"delivery=disabled/unmanaged",
+		"runtime_revision=" + runtimeRevision,
+		"change=" + change,
+		"objective_id=" + objective.ID,
+		fmt.Sprintf("objective_generation=%d", objective.Generation),
+		"failed_evidence_revision=" + failed.EvidenceRevision,
+		"failed_candidate_identity=" + failed.FinishCandidateIdentity,
+		"failed_candidate_tree=" + failed.FinishCandidateTree,
+		"work_unit=" + workUnit,
+		"evidence_goal=" + evidenceGoal,
+		"max_attempts=1",
+		fmt.Sprintf("max_changed_lines=%d", maxChangedLines),
+		"actor=" + actor,
+		"reason=" + reason,
+	}, "\n")
+}
+
 func validTerminalAttemptOutcome(outcome AttemptOutcome) bool {
 	return outcome == AttemptFailed || outcome == AttemptInterrupted || outcome == AttemptPassed
 }
 
 func validHarnessDisposition(disposition HarnessDisposition) bool {
 	return disposition == HarnessReused || disposition == HarnessInvalidated
+}
+
+func (store RuntimeStore) reviewDisabled() (bool, error) {
+	if store.ReviewDisabledCheck != nil {
+		return store.ReviewDisabledCheck()
+	}
+	return store.ReviewDisabled, nil
+}
+
+func unmanagedRemediationConsumed(status RuntimeStatus) bool {
+	return status.LastReset != nil && status.LastReset.Disposition == ResetDispositionFailedEvidenceRemediation &&
+		status.Objective != nil && status.Objective.Generation == status.LastReset.PreviousGeneration+1
 }
 
 func captureRuntimeCandidate(ctx context.Context, repo string) (reviewtransaction.Snapshot, error) {
