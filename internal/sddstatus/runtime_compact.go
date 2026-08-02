@@ -154,7 +154,8 @@ func (store RuntimeStore) Settle(ctx context.Context, request CompactSettleReque
 	if request.RemediatesEvidenceRevision != "" && failedEvidence != request.RemediatesEvidenceRevision {
 		return compactBlocked(CompactBlockInvalidContinuation, ""), nil
 	}
-	if request.Outcome == AttemptPassed && status.Binding != nil && failedEvidence != "" && (!store.ReviewDisabled || explicitSuccessor || request.RemediatesEvidenceRevision != "") {
+	reviewDisabled, _ := store.reviewDisabled()
+	if request.Outcome == AttemptPassed && status.Binding != nil && failedEvidence != "" && (!reviewDisabled || explicitSuccessor || request.RemediatesEvidenceRevision != "") {
 		finish.ExpectedBindingRevision = status.Binding.Revision
 		finish.SuccessorLineageID = request.SuccessorLineageID
 		if finish.SuccessorLineageID == "" {
