@@ -51,6 +51,8 @@ func runSDDAttempt(ctx context.Context, args []string, stdout io.Writer) error {
 	expectedBindingRevision := flags.String("expected-binding-revision", "", "exact populated binding revision for atomic remediation")
 	successorLineage := flags.String("successor-lineage", "", "approved compact recovery successor lineage")
 	remediatesEvidenceRevision := flags.String("remediates-evidence-revision", "", "failed evidence revision repaired by the successor")
+	disposition := flags.String("disposition", "", "typed objective reset disposition")
+	maintainerAuthorization := flags.String("maintainer-authorization", "", "opaque exact maintainer authorization binding")
 	reason := flags.String("reason", "", "explicit objective reset reason")
 	actor := flags.String("actor", "", "explicit reset actor")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -74,7 +76,11 @@ func runSDDAttempt(ctx context.Context, args []string, stdout io.Writer) error {
 	// knows how to read both of its sources. With reviews off, closing an
 	// attempt must not demand a review obligation the operator has no way to
 	// satisfy.
-	store.ReviewDisabled = reviewDrivenDevelopmentDisabled(ctx, *cwd)
+	store.ReviewDisabledCheck = func() (bool, error) {
+		status, modeErr := reviewModeStatus(ctx, *cwd)
+		return modeErr == nil && !status.Enabled(), modeErr
+	}
+	store.RequireUnmanagedEligibility = true
 	var result any
 	switch operation {
 	case "status":
@@ -107,8 +113,16 @@ func runSDDAttempt(ctx context.Context, args []string, stdout io.Writer) error {
 		if missing := missingSDDAttemptFlags(args[1:], "expected-revision", "request-id", "reason", "actor"); len(missing) != 0 {
 			return fmt.Errorf("sdd-attempt reset requires %s", strings.Join(missing, ", "))
 		}
+		if *disposition != "" {
+			if missing := missingSDDAttemptFlags(args[1:], "disposition", "remediates-evidence-revision", "work-unit", "evidence-goal", "max-changed-lines", "maintainer-authorization"); len(missing) != 0 {
+				return fmt.Errorf("sdd-attempt reset remediation requires %s; rerun `gentle-ai sdd-attempt reset` with those missing flags", strings.Join(missing, ", "))
+			}
+		}
 		result, err = store.Reset(ctx, sddstatus.ResetObjectiveRequest{
 			ExpectedRevision: *expected, RequestID: *requestID, Reason: *reason, Actor: *actor,
+			Disposition: sddstatus.ResetDisposition(*disposition), RemediatesEvidenceRevision: *remediatesEvidenceRevision,
+			WorkUnit: *workUnit, EvidenceGoal: *evidenceGoal, MaxChangedLines: *maxChangedLines,
+			MaintainerAuthorization: *maintainerAuthorization,
 		})
 	case "acquire":
 		if missing := missingSDDAttemptFlags(args[1:], "request-id", "work-unit", "evidence-goal"); len(missing) != 0 {
@@ -177,7 +191,7 @@ func validateSDDAttemptOperationFlags(operation string, args []string) error {
 	for _, name := range map[string][]string{
 		"begin":   {"expected-revision", "request-id", "work-unit", "evidence-goal", "max-attempts", "max-changed-lines"},
 		"finish":  {"expected-revision", "request-id", "outcome", "evidence-revision", "diagnosis", "harness-disposition", "cleanup-evidence", "process-evidence", "expected-binding-revision", "successor-lineage", "remediates-evidence-revision"},
-		"reset":   {"expected-revision", "request-id", "reason", "actor"},
+		"reset":   {"expected-revision", "request-id", "reason", "actor", "disposition", "remediates-evidence-revision", "work-unit", "evidence-goal", "max-changed-lines", "maintainer-authorization"},
 		"acquire": {"request-id", "work-unit", "evidence-goal", "max-attempts", "max-changed-lines"},
 		"settle":  {"token", "request-id", "outcome", "evidence-revision", "diagnosis", "harness-disposition", "cleanup-evidence", "process-evidence", "successor-lineage", "remediates-evidence-revision"},
 	}[operation] {

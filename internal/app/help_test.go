@@ -126,3 +126,14 @@ func TestHelpCommandsHeadingIsAligned(t *testing.T) {
 		t.Fatalf("help output has inconsistent command indentation:\n%s", buf.String())
 	}
 }
+
+func TestHelpDocumentsUnmanagedFailedEvidenceRemediation(t *testing.T) {
+	var buf bytes.Buffer
+	printHelp(&buf, "v1.0.0-test")
+	output := buf.String()
+	for _, want := range []string{"failed-evidence-remediation", "--remediates-evidence-revision", "--work-unit", "--evidence-goal", "--max-changed-lines", "--maintainer-authorization", "CAS/actor/reason"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("help output missing %q:\n%s", want, output)
+		}
+	}
+}

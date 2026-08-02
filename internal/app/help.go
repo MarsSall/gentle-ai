@@ -63,6 +63,9 @@ COMPATIBILITY COMMANDS
                Bundle, policy, ledger, fix-delta, evidence, CI, and release flags are optional compatibility or exceptional inputs
   sdd-attempt <status|begin|finish|reset> --cwd <repo> --change <change>
                Diagnose or explicitly recover the full native runtime-attempt ledger
+               Unmanaged failed-evidence remediation uses reset --disposition failed-evidence-remediation
+               with --remediates-evidence-revision, --work-unit, --evidence-goal,
+               --max-changed-lines, --maintainer-authorization, and the existing CAS/actor/reason flags
   update       Check for available updates
   upgrade      Apply updates to managed tools
   restore      Restore a config backup

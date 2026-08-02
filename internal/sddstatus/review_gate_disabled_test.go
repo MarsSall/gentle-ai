@@ -387,3 +387,78 @@ func TestDisabledReviewModeDoesNotBlockPreVerifyRouting(t *testing.T) {
 		}
 	}
 }
+
+func TestDisabledSubstantiveFailureRoutesThroughOneUnmanagedCorrectionToVerify(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	changeRoot := seedReadyChange(t, root, "thin", "- [x] 1.1 Work\n")
+	evidence := shaID("d")
+	report := strings.Replace(boundedVerifyEnvelope(evidence, "fail"), "blockers: 0", "blockers: 1", 1)
+	write(t, filepath.Join(changeRoot, "verify-report.md"), report)
+	runSDDStatusGit(t, root, "init", "-q")
+	runSDDStatusGit(t, root, "config", "user.email", "status@example.com")
+	runSDDStatusGit(t, root, "config", "user.name", "Status Test")
+	runSDDStatusGit(t, root, "add", ".")
+	runSDDStatusGit(t, root, "commit", "-qm", "failed candidate")
+	store, err := OpenRuntimeStore(ctx, root, "thin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.ReviewDisabled = true
+	started, err := store.Begin(ctx, BeginAttemptRequest{RequestID: "verify-begin", WorkUnit: "verify", EvidenceGoal: "independent verification", MaxAttempts: 1, MaxChangedLines: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err := store.Finish(ctx, FinishAttemptRequest{ExpectedRevision: started.Revision, RequestID: "verify-finish", Outcome: AttemptFailed, EvidenceRevision: evidence, Diagnosis: "substantive verification failure", HarnessDisposition: HarnessReused, CleanupEvidence: "verification cleanup completed", ProcessEvidence: "verification process scan completed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := Resolve(ResolveOptions{CWD: root, ChangeName: "thin", ReviewDisabled: true, IncludeInstructions: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.NextRecommended != "remediate" || !status.RemediationState.Required || status.RemediationState.FailedEvidenceRevision != evidence ||
+		status.ReviewTransaction != nil || status.ReviewGate == nil || status.ReviewGate.Result == reviewtransaction.GateAllow ||
+		status.ReviewGate.Delivery != reviewtransaction.RDDDeliveryDisabledUnmanaged {
+		t.Fatalf("unmanaged failed status = %#v", status)
+	}
+	if status.PhaseInstructions == nil || !strings.Contains(strings.Join(status.PhaseInstructions.Remediate, "\n"), "--maintainer-authorization") {
+		t.Fatalf("remediation instructions = %#v", status.PhaseInstructions)
+	}
+	invalidReceipt := filepath.Join(changeRoot, "reviews", "receipt.json")
+	write(t, invalidReceipt, "{invalid\n")
+	blocked, err := Resolve(ResolveOptions{CWD: root, ChangeName: "thin", ReviewDisabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.RemediationState.Required {
+		t.Fatalf("explicit invalid review state admitted unmanaged remediation: %#v", blocked)
+	}
+	if err := os.Remove(invalidReceipt); err != nil {
+		t.Fatal(err)
+	}
+
+	resetRequest := ResetObjectiveRequest{ExpectedRevision: failed.Revision, RequestID: "authorize", Reason: "maintainer authorized one correction", Actor: "maintainer", Disposition: ResetDispositionFailedEvidenceRemediation, RemediatesEvidenceRevision: evidence, WorkUnit: "correction", EvidenceGoal: "correct failed behavior", MaxChangedLines: 20}
+	resetRequest.MaintainerAuthorization = renderUnmanagedRemediationAuthorization(failed.Revision, store.Change, *failed.Objective,
+		failed.Attempts[len(failed.Attempts)-1], resetRequest.WorkUnit, resetRequest.EvidenceGoal, resetRequest.MaxChangedLines, resetRequest.Actor, resetRequest.Reason)
+	authorized, err := store.Reset(ctx, resetRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.Begin(ctx, BeginAttemptRequest{ExpectedRevision: authorized.Revision, RequestID: "correction-begin", WorkUnit: "correction", EvidenceGoal: "correct failed behavior", MaxAttempts: 1, MaxChangedLines: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(changeRoot, "tasks.md"), "- [x] 1.1 Work\n<!-- corrected -->\n")
+	if _, err := store.Finish(ctx, FinishAttemptRequest{ExpectedRevision: active.Revision, RequestID: "correction-finish", Outcome: AttemptPassed, EvidenceRevision: shaID("e"), Diagnosis: "bounded correction passed", HarnessDisposition: HarnessReused, CleanupEvidence: "correction cleanup completed", ProcessEvidence: "correction process scan completed"}); err != nil {
+		t.Fatal(err)
+	}
+	status, err = Resolve(ResolveOptions{CWD: root, ChangeName: "thin", ReviewDisabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.NextRecommended != "verify" || status.Dependencies.Verify != DependencyReady || status.Dependencies.Archive != DependencyBlocked || status.RemediationState.Required {
+		t.Fatalf("completed unmanaged correction status = %#v", status)
+	}
+}

@@ -441,8 +441,17 @@ func Resolve(options ResolveOptions) (Status, error) {
 		reviewStateReason,
 		readText(firstPath(artifactPaths.ApplyProgress)),
 	)
+	if runtimeStatusErr == nil {
+		if unmanaged, complete := resolveUnmanagedRemediationState(context.Background(), workspaceRoot, changeName, reviewDisabled,
+			readText(firstPath(artifactPaths.VerifyReport)), specCounts, artifacts, runtimeStatus, firstPath(artifactPaths.ReviewReceipt), ""); unmanaged.Required || complete {
+			remediationState, runtimeRemediationComplete = unmanaged, complete
+		}
+	}
 	dependencies := resolveDependencies(artifacts, taskProgress, applyState, coreReady, verifyResult.Passing, remediationState.Complete)
 	nextRecommended := resolveNextRecommended(dependencies, applyState, artifacts["verifyReport"] == ArtifactDone, remediationState)
+	if runtimeRemediationComplete {
+		dependencies.Verify, dependencies.Archive, nextRecommended = DependencyReady, DependencyBlocked, "verify"
+	}
 	if staleAllowAuthority != nil {
 		dependencies.Verify = DependencyReady
 		dependencies.Archive = DependencyBlocked
@@ -516,6 +525,9 @@ func Resolve(options ResolveOptions) (Status, error) {
 	if boundGate != nil {
 		status.ReviewGate = boundGate
 	}
+	if status.ReviewGate == nil && remediationState.Required && strings.Contains(remediationState.Reason, "unmanaged correction") {
+		applyReviewGateEvaluation(&status, resolveReviewAuthority(context.Background(), workspaceRoot, firstPath(artifactPaths.ReviewReceipt), "", changeName), true)
+	}
 	if runtimeStatusErr != nil {
 		applyNativeRuntimeErrorRouting(&status, runtimeStatusErr)
 	} else {
@@ -564,13 +576,83 @@ func workspaceHasGitMetadata(workspaceRoot string) bool {
 	}
 }
 
+func resolveUnmanagedRemediationState(ctx context.Context, repo, change string, reviewDisabled bool, report string, counts SpecCounts,
+	artifacts map[string]ArtifactState, runtimeStatus *RuntimeStatus, receiptPath, receiptContent string) (RemediationState, bool) {
+	if !reviewDisabled || runtimeStatus == nil || runtimeStatus.Binding != nil {
+		return RemediationState{}, false
+	}
+	for _, name := range []string{"reviewLedger", "reviewReceipt", "reviewBundle", "reviewContext", "reviewState"} {
+		if artifacts[name] != ArtifactMissing {
+			return RemediationState{}, false
+		}
+	}
+	admission := ValidateVerifyReportAdmission(report, counts)
+	parsed, reason := parseVerifyReport(report)
+	if !admission.Valid || admission.Verdict != "fail" || reason != "" || parsed.AuthorityOnly {
+		return RemediationState{}, false
+	}
+	if authority := resolveReviewAuthority(ctx, repo, receiptPath, receiptContent, change); !authority.Absent {
+		return RemediationState{}, false
+	}
+	verify := verifyResultEvaluation{EvidenceRevision: admission.EvidenceRevision}
+	if nativeRuntimeCompletesRemediation(runtimeStatus, verify) {
+		return RemediationState{}, true
+	}
+	if unmanagedRemediationConsumed(*runtimeStatus) {
+		return RemediationState{}, false
+	}
+	if len(runtimeStatus.Attempts) == 0 {
+		return RemediationState{}, false
+	}
+	last := runtimeStatus.Attempts[len(runtimeStatus.Attempts)-1]
+	failedRevision := admission.EvidenceRevision
+	if reset := runtimeStatus.LastReset; reset != nil && reset.Disposition == ResetDispositionFailedEvidenceRemediation {
+		if reset.RemediatesEvidenceRevision != failedRevision || reset.MaxAttempts != 1 || reset.MaxChangedLines < 1 {
+			return RemediationState{}, false
+		}
+		if runtimeStatus.ActiveAttempt == nil && runtimeStatus.Objective == nil {
+			store, err := OpenRuntimeStore(ctx, repo, change)
+			if err != nil {
+				return RemediationState{}, false
+			}
+			candidate, err := captureRuntimeTerminalCandidate(ctx, store, last.BeginCandidateTree)
+			if err != nil || candidate.Identity != reset.ResetCandidateIdentity || candidate.CandidateTree != reset.ResetCandidateTree {
+				return RemediationState{}, false
+			}
+		}
+		return RemediationState{Required: true, FailedEvidenceRevision: failedRevision, Reason: "one maintainer-authorized unmanaged correction is pending for the admitted failed evidence"}, false
+	}
+	if runtimeStatus.ActiveAttempt != nil || runtimeStatus.Objective == nil || last.Outcome != AttemptFailed ||
+		last.ObjectiveID != runtimeStatus.Objective.ID || last.ObjectiveGeneration != runtimeStatus.Objective.Generation || last.EvidenceRevision != failedRevision {
+		return RemediationState{}, false
+	}
+	store, err := OpenRuntimeStore(ctx, repo, change)
+	if err != nil {
+		return RemediationState{}, false
+	}
+	candidate, err := captureRuntimeTerminalCandidate(ctx, store, last.BeginCandidateTree)
+	if err != nil || candidate.Identity != last.FinishCandidateIdentity || candidate.CandidateTree != last.FinishCandidateTree {
+		return RemediationState{}, false
+	}
+	return RemediationState{Required: true, FailedEvidenceRevision: failedRevision, Reason: "admitted failed verification requires one explicit maintainer-authorized unmanaged correction"}, false
+}
+
+func unmanagedRemediationCompleted(status RuntimeStatus) bool {
+	if status.LastReset == nil || status.LastReset.Disposition != ResetDispositionFailedEvidenceRemediation || status.Objective == nil || len(status.Attempts) == 0 {
+		return false
+	}
+	last := status.Attempts[len(status.Attempts)-1]
+	return status.Objective.Generation == status.LastReset.PreviousGeneration+1 && last.ObjectiveID == status.Objective.ID &&
+		last.Outcome == AttemptPassed && last.RemediatesEvidenceRevision == status.LastReset.RemediatesEvidenceRevision
+}
+
 func nativeRuntimeCompletesRemediation(runtimeStatus *RuntimeStatus, verify verifyResultEvaluation) bool {
 	if runtimeStatus == nil || !runtimeStatus.Complete || runtimeStatus.DecisionRequired || runtimeStatus.ActiveAttempt != nil ||
-		runtimeStatus.Binding == nil || verify.EvidenceRevision == "" || len(runtimeStatus.Attempts) == 0 {
+		verify.EvidenceRevision == "" || len(runtimeStatus.Attempts) == 0 {
 		return false
 	}
 	last := runtimeStatus.Attempts[len(runtimeStatus.Attempts)-1]
-	return last.Outcome == AttemptPassed && !last.ChangedLineBudgetExceeded &&
+	return last.Outcome == AttemptPassed && !last.ChangedLineBudgetExceeded && (runtimeStatus.Binding != nil || unmanagedRemediationCompleted(*runtimeStatus)) &&
 		last.RemediatesEvidenceRevision == verify.EvidenceRevision &&
 		last.EvidenceRevision != "" && last.EvidenceRevision == runtimeStatus.EvidenceRevision
 }
@@ -595,7 +677,7 @@ func applyNativeRuntimeErrorRouting(status *Status, runtimeErr error) {
 }
 
 func applyNativeRuntimeRouting(status *Status) {
-	if status == nil || status.RuntimeStatus == nil {
+	if status == nil || status.RuntimeStatus == nil || status.RemediationState.Required {
 		return
 	}
 	runtimeStatus := status.RuntimeStatus
@@ -729,11 +811,20 @@ func resolveEngramStatus(workspaceRoot string, requestedChange string, includeIn
 		reviewStateReason,
 		artifactsByType["apply-progress"].Content,
 	)
+	if runtimeStatusErr == nil {
+		if unmanaged, complete := resolveUnmanagedRemediationState(context.Background(), workspaceRoot, changeName, reviewDisabled,
+			artifactsByType["verify-report"].Content, specCounts, artifacts, runtimeStatus, "", artifactsByType["review/receipt"].Content); unmanaged.Required || complete {
+			remediationState, runtimeRemediationComplete = unmanaged, complete
+		}
+	}
 	if remediationState.Reason != "" {
 		blockedReasons.genuine = append(blockedReasons.genuine, remediationState.Reason)
 	}
 	dependencies := resolveDependencies(artifacts, taskProgress, applyState, coreReady, verifyResult.Passing, remediationState.Complete)
 	nextRecommended := resolveNextRecommended(dependencies, applyState, artifacts["verifyReport"] == ArtifactDone, remediationState)
+	if runtimeRemediationComplete {
+		dependencies.Verify, dependencies.Archive, nextRecommended = DependencyReady, DependencyBlocked, "verify"
+	}
 	if staleAllowAuthority != nil {
 		dependencies.Verify = DependencyReady
 		dependencies.Archive = DependencyBlocked
@@ -801,6 +892,9 @@ func resolveEngramStatus(workspaceRoot string, requestedChange string, includeIn
 	}
 	if boundGate != nil {
 		status.ReviewGate = boundGate
+	}
+	if status.ReviewGate == nil && remediationState.Required && strings.Contains(remediationState.Reason, "unmanaged correction") {
+		applyReviewGateEvaluation(&status, resolveReviewAuthority(context.Background(), workspaceRoot, "", artifactsByType["review/receipt"].Content, changeName), true)
 	}
 	if runtimeStatusErr != nil {
 		applyNativeRuntimeErrorRouting(&status, runtimeStatusErr)
@@ -1660,6 +1754,15 @@ func renderPhaseInstructions(status Status) PhaseInstructions {
 		"Bind focused tests, runtime harness evidence, and rollback evidence to the exact failed evidence revision.",
 		"A bare remediation envelope or stale failed revision never completes remediation.",
 		"A passing bound remediation MUST finish atomically with --expected-binding-revision, --successor-lineage, and --remediates-evidence-revision so the charged evidence and approved compact successor share one native HEAD CAS.",
+	}
+	if status.RemediationState.Required && strings.Contains(status.RemediationState.Reason, "unmanaged correction") {
+		remediateInstructions = []string{
+			fmt.Sprintf("Change: %s", change),
+			"Receipt-driven review is disabled; this correction creates no review transaction, receipt, binding, approval, or GateAllow.",
+			fmt.Sprintf("A maintainer may authorize exactly one correction for failed evidence %s with `gentle-ai sdd-attempt reset --cwd %q --change %q --expected-revision <runtime-revision> --request-id <unique-request-id> --reason <reason> --actor <actor> --disposition failed-evidence-remediation --remediates-evidence-revision %s --work-unit <label> --evidence-goal <goal> --max-changed-lines <positive> --maintainer-authorization <exact-binding>`.", status.RemediationState.FailedEvidenceRevision, status.ActionContext.WorkspaceRoot, change, status.RemediationState.FailedEvidenceRevision),
+			"The exact LF-only binding uses gentle-ai.sdd-unmanaged-remediation-authorization/v1 and binds disabled/unmanaged delivery, runtime revision, change, predecessor objective/generation, failed evidence/candidate, scope, actor, and reason. It is never emitted in status or errors.",
+			"Acquire the authorized correction with the exact work unit, evidence goal, line ceiling, and --max-attempts 1. Every terminal outcome consumes it; a successful correction routes only to fresh independent verification.",
+		}
 	}
 	return PhaseInstructions{
 		Apply:     append(applyInstructions, runtimeInstructions...),

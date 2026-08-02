@@ -74,6 +74,7 @@ func TestRunSDDAttemptRejectsMissingOrAmbiguousInputs(t *testing.T) {
 		{name: "missing begin CAS", args: []string{"begin", "--cwd", repo, "--change", "thin", "--request-id", "begin", "--work-unit", "unit", "--evidence-goal", "goal"}, want: "--expected-revision"},
 		{name: "missing finish evidence", args: []string{"finish", "--cwd", repo, "--change", "thin", "--expected-revision", cliAttemptHash('b'), "--request-id", "finish", "--outcome", "failed", "--diagnosis", "diagnosis", "--harness-disposition", "reused", "--cleanup-evidence", "cleanup", "--process-evidence", "process"}, want: "--evidence-revision"},
 		{name: "partial remediation successor", args: []string{"finish", "--cwd", repo, "--change", "thin", "--expected-revision", cliAttemptHash('b'), "--request-id", "finish", "--outcome", "passed", "--evidence-revision", cliAttemptHash('c'), "--diagnosis", "diagnosis", "--harness-disposition", "reused", "--cleanup-evidence", "cleanup", "--process-evidence", "process", "--successor-lineage", "review-successor"}, want: "remediation successor requires --expected-binding-revision, --successor-lineage, and --remediates-evidence-revision together"},
+		{name: "partial unmanaged authorization", args: []string{"reset", "--cwd", repo, "--change", "thin", "--expected-revision", cliAttemptHash('b'), "--request-id", "reset", "--reason", "reason", "--actor", "maintainer", "--disposition", "failed-evidence-remediation"}, want: "rerun `gentle-ai sdd-attempt reset` with those missing flags"},
 		{name: "positional argument", args: []string{"status", "--cwd", repo, "--change", "thin", "extra"}, want: "unexpected sdd-attempt argument"},
 	}
 	for _, tt := range tests {
@@ -84,6 +85,16 @@ func TestRunSDDAttemptRejectsMissingOrAmbiguousInputs(t *testing.T) {
 				t.Fatalf("RunSDDAttempt(%v) = output %q, err %v, want %q", tt.args, output.String(), err, tt.want)
 			}
 		})
+	}
+}
+
+func TestRunSDDAttemptNeverEchoesMaintainerAuthorization(t *testing.T) {
+	repo := initReviewCLIRepo(t)
+	const secret = "opaque-secret-maintainer-binding"
+	var output bytes.Buffer
+	err := RunSDDAttempt([]string{"reset", "--cwd", repo, "--change", "thin", "--expected-revision", cliAttemptHash('b'), "--request-id", "reset", "--reason", "reason", "--actor", "maintainer", "--disposition", "unsupported", "--remediates-evidence-revision", cliAttemptHash('c'), "--work-unit", "correction", "--evidence-goal", "correct evidence", "--max-changed-lines", "10", "--maintainer-authorization", secret}, &output)
+	if err == nil || strings.Contains(err.Error(), secret) || strings.Contains(output.String(), secret) {
+		t.Fatalf("authorization leaked: output=%q err=%v", output.String(), err)
 	}
 }
 

@@ -987,6 +987,48 @@ func TestResolveEngramRoutesStaleVerifyEvidenceToVerifyUnderApprovedCompactAutho
 	}
 }
 
+func TestResolveEngramRoutesAdmittedDisabledFailureToUnmanagedRemediation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	seedReadyChange(t, root, "seed", "- [x] 1.1 Done\n")
+	runSDDStatusGit(t, root, "init", "-q")
+	runSDDStatusGit(t, root, "config", "user.email", "status@example.com")
+	runSDDStatusGit(t, root, "config", "user.name", "Status Test")
+	runSDDStatusGit(t, root, "add", ".")
+	runSDDStatusGit(t, root, "commit", "-qm", "seed")
+	mkdir(t, filepath.Join(root, ".engram"))
+	evidence := shaID("d")
+	report := strings.Replace(boundedVerifyEnvelope(evidence, "fail"), "blockers: 0", "blockers: 1", 1)
+	project := strings.ToLower(filepath.Base(root))
+	restore := stubEngramExport(t, []engramObservation{
+		{Title: "sdd/thin/proposal", Content: "# Proposal\n", Project: project, Scope: "project"},
+		{Title: "sdd/thin/spec", Content: "### Requirement: Auth\n#### Scenario: Valid login\n", Project: project, Scope: "project"},
+		{Title: "sdd/thin/design", Content: "# Design\n", Project: project, Scope: "project"},
+		{Title: "sdd/thin/tasks", Content: "- [x] 1.1 Done\n", Project: project, Scope: "project"},
+		{Title: "sdd/thin/verify-report", Content: report, Project: project, Scope: "project"},
+	})
+	defer restore()
+	store, err := OpenRuntimeStore(ctx, root, "thin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.ReviewDisabled = true
+	started, err := store.Begin(ctx, BeginAttemptRequest{RequestID: "begin", WorkUnit: "verify", EvidenceGoal: "independent verification", MaxAttempts: 1, MaxChangedLines: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Finish(ctx, FinishAttemptRequest{ExpectedRevision: started.Revision, RequestID: "finish", Outcome: AttemptFailed, EvidenceRevision: evidence, Diagnosis: "substantive failure", HarnessDisposition: HarnessReused, CleanupEvidence: "cleanup completed", ProcessEvidence: "process scan completed"}); err != nil {
+		t.Fatal(err)
+	}
+	status, ok, err := resolveEngramStatus(root, "thin", true, true)
+	if err != nil || !ok {
+		t.Fatalf("resolveEngramStatus() = ok %v, err %v", ok, err)
+	}
+	if status.NextRecommended != "remediate" || !status.RemediationState.Required || status.RemediationState.FailedEvidenceRevision != evidence || status.ReviewTransaction != nil {
+		t.Fatalf("Engram unmanaged remediation status = %#v", status)
+	}
+}
+
 func TestResolveEngramRejectsForeignCompactAuthorityForStaleVerifyEvidence(t *testing.T) {
 	root := t.TempDir()
 	foreignRoot := seedReadyChange(t, root, "other", "- [x] 1.1 Done\n")
