@@ -2,9 +2,39 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 )
+
+func TestSandboxEnvironmentIsolatesCrossPlatformUserAndTempRoots(t *testing.T) {
+	root := t.TempDir()
+	sandbox, err := newSandbox("gentle-ai", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]string{}
+	for _, entry := range sandbox.env() {
+		for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"} {
+			prefix := key + "="
+			if len(entry) >= len(prefix) && entry[:len(prefix)] == prefix {
+				values[key] = entry[len(prefix):]
+			}
+		}
+	}
+	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"} {
+		value := values[key]
+		if value == "" {
+			t.Fatalf("sandbox environment omitted %s", key)
+		}
+		if info, err := os.Stat(value); err != nil || !info.IsDir() {
+			t.Fatalf("sandbox %s directory %q is unavailable: %v", key, value, err)
+		}
+	}
+}
 
 // fakeBinary writes an executable that answers a fixed argv with a fixed
 // message, so the capability probe can be tested without a real gentle-ai.
@@ -18,10 +48,46 @@ func fakeBinary(t *testing.T, script string) *Sandbox {
 	if err := os.MkdirAll(sandbox.Repo, 0o755); err != nil {
 		t.Fatalf("mkdir repo: %v", err)
 	}
+	if runtime.GOOS == "windows" {
+		sandbox.Binary += ".exe"
+		source := windowsFakeBinarySource(script)
+		sourcePath := filepath.Join(root, "fake.go")
+		if err := os.WriteFile(sourcePath, []byte(source), 0o644); err != nil {
+			t.Fatalf("write fake source: %v", err)
+		}
+		if output, err := exec.Command("go", "build", "-o", sandbox.Binary, sourcePath).CombinedOutput(); err != nil {
+			t.Fatalf("build fake binary: %v: %s", err, output)
+		}
+		return sandbox
+	}
 	if err := os.WriteFile(sandbox.Binary, []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
 		t.Fatalf("write fake binary: %v", err)
 	}
 	return sandbox
+}
+
+func windowsFakeBinarySource(script string) string {
+	if strings.Contains(script, `case "$*"`) {
+		return `package main
+import ("fmt"; "os"; "strings")
+func main() {
+	if strings.Contains(strings.Join(os.Args[1:], " "), "--help") { fmt.Fprintln(os.Stderr, "Error: flag provided but not defined: -help") } else { fmt.Fprintln(os.Stderr, "Error: sdd-attempt requires --cwd") }
+	os.Exit(1)
+}`
+	}
+	if strings.Contains(script, "GIT_TRACE") {
+		return `package main
+import ("fmt"; "os")
+func main() { fmt.Printf("GIT_TRACE=[%s]\n", os.Getenv("GIT_TRACE")) }`
+	}
+	message := ""
+	if start := strings.Index(script, `echo "`); start >= 0 {
+		rest := script[start+len(`echo "`):]
+		if end := strings.Index(rest, `"`); end >= 0 {
+			message = rest[:end]
+		}
+	}
+	return "package main\nimport (\"fmt\"; \"os\")\nfunc main() { fmt.Fprintln(os.Stderr, " + strconv.Quote(message) + "); os.Exit(1) }\n"
 }
 
 // A build that HAS the flag fails on state, not on shape. The probe must read

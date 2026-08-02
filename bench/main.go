@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -388,7 +389,10 @@ func writeJSON(path string, value any) error {
 
 func executable(path string) bool {
 	info, err := os.Stat(path)
-	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
+	if err != nil || info.IsDir() {
+		return false
+	}
+	return runtime.GOOS == "windows" && strings.EqualFold(filepath.Ext(path), ".exe") || info.Mode()&0o111 != 0
 }
 
 func binaryVersion(path string) string {

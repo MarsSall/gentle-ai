@@ -33,7 +33,7 @@ type Sandbox struct {
 
 func newSandbox(binary, root string) (*Sandbox, error) {
 	home := filepath.Join(root, "home")
-	for _, dir := range []string{home, filepath.Join(home, ".config"), filepath.Join(home, ".cache"), filepath.Join(home, ".local", "share"), filepath.Join(home, ".local", "state")} {
+	for _, dir := range []string{home, filepath.Join(home, ".config"), filepath.Join(home, ".cache"), filepath.Join(home, ".local", "share"), filepath.Join(home, ".local", "state"), filepath.Join(home, "tmp"), filepath.Join(home, "AppData", "Roaming"), filepath.Join(home, "AppData", "Local")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, err
 		}
@@ -55,6 +55,11 @@ func (s *Sandbox) env() []string {
 	return []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + s.Home,
+		"USERPROFILE=" + s.Home,
+		"APPDATA=" + filepath.Join(s.Home, "AppData", "Roaming"),
+		"LOCALAPPDATA=" + filepath.Join(s.Home, "AppData", "Local"),
+		"TEMP=" + filepath.Join(s.Home, "tmp"),
+		"TMP=" + filepath.Join(s.Home, "tmp"),
 		"XDG_CONFIG_HOME=" + filepath.Join(s.Home, ".config"),
 		"XDG_CACHE_HOME=" + filepath.Join(s.Home, ".cache"),
 		"XDG_DATA_HOME=" + filepath.Join(s.Home, ".local", "share"),

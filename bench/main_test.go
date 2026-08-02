@@ -5,10 +5,39 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+func TestExecutableUsesHostConvention(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gentle-ai")
+	if runtime.GOOS == "windows" {
+		path += ".exe"
+	}
+	if err := os.WriteFile(path, []byte("binary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		if !executable(path) {
+			t.Fatal("regular .exe was rejected on Windows")
+		}
+		if executable(strings.TrimSuffix(path, ".exe")) {
+			t.Fatal("non-.exe path was accepted on Windows")
+		}
+		return
+	}
+	if executable(path) {
+		t.Fatal("regular file without execute bits was accepted")
+	}
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !executable(path) {
+		t.Fatal("file with execute bits was rejected")
+	}
+}
 
 // Community issue #1883: a corpus run with failed journeys exited 0, so a CI
 // gate reading the exit code saw success in a run that measured nothing for
